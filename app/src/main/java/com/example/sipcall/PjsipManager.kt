@@ -141,8 +141,8 @@ class PjsipManager(private val listener: Listener) {
             acfg.sipConfig.authCreds.add(cred)
 
             // If audio is one-way on a real call, uncomment both:
-            // acfg.natConfig.iceEnabled = true
-            // acfg.sipConfig.proxies.add("sip:$serverIp:$serverPort;lr")
+             acfg.natConfig.iceEnabled = false
+             acfg.sipConfig.proxies.add("sip:$serverIp:$serverPort;lr")
 
             val acc = SipAccount(listener, this, ep)
             listener.onLog("Creating account sip:$username@$serverIp ...")
