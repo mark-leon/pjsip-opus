@@ -1,7 +1,9 @@
 package com.example.sipcall
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.os.Bundle
 import android.widget.Button
 import android.widget.EditText
@@ -13,6 +15,7 @@ import androidx.core.content.ContextCompat
 class MainActivity : AppCompatActivity(), PjsipManager.Listener {
 
     private lateinit var pjsip: PjsipManager
+    private lateinit var audioManager: AudioManager
 
     private lateinit var serverIpInput: EditText
     private lateinit var usernameInput: EditText
@@ -24,9 +27,16 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
     private lateinit var statusView: TextView
     private lateinit var logView: TextView
 
+    private var savedAudioMode: Int = AudioManager.MODE_NORMAL
+    private var savedSpeakerphone: Boolean = false
+    private var savedMicMute: Boolean = false
+    private var voiceModeActive: Boolean = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         serverIpInput = findViewById(R.id.server_ip)
         usernameInput = findViewById(R.id.username)
@@ -39,9 +49,9 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
         logView = findViewById(R.id.log)
 
         serverIpInput.setText("103.209.42.30")
-        usernameInput.setText("09638917518")
+        usernameInput.setText("09638917817")
         passwordInput.setText("1234")
-        destNumberInput.setText("01673779266")
+        destNumberInput.setText("01716517528")
 
         ensurePermissions()
 
@@ -56,6 +66,12 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
             )
         }
         callBtn.setOnClickListener {
+            // CRITICAL: enter voice mode BEFORE PJSIP opens the audio device.
+            // PJSIP opens the device synchronously inside makeCall(), and on
+            // Android the device's routing is decided AT OPEN TIME based on
+            // the current AudioManager.mode. Setting it after the call starts
+            // is too late — the mic ends up on the wrong path and captures silence.
+            enterVoiceCallMode()
             pjsip.call(destNumberInput.text.toString().trim())
         }
         hangupBtn.setOnClickListener {
@@ -65,6 +81,7 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
 
     override fun onDestroy() {
         super.onDestroy()
+        if (voiceModeActive) restoreAudioMode()
         pjsip.shutdown()
     }
 
@@ -81,7 +98,45 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
         }
     }
 
-    // ---- PjsipManager.Listener ----
+    private fun enterVoiceCallMode() {
+        if (voiceModeActive) return
+        savedAudioMode = audioManager.mode
+        savedSpeakerphone = audioManager.isSpeakerphoneOn
+        @Suppress("DEPRECATION")
+        savedMicMute = audioManager.isMicrophoneMute
+
+        // VoIP mode
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+
+        // Force speakerphone ON so audio comes out the loud speaker
+        audioManager.isSpeakerphoneOn = true
+
+        // Make sure mic isn't muted
+        @Suppress("DEPRECATION")
+        audioManager.isMicrophoneMute = false
+
+        // Crank the call volume to max so we can definitely hear it
+        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+        audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, maxVol, 0)
+
+        // Also bump the music stream as a fallback in case routing is wrong
+        val maxMusic = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, maxMusic, 0)
+
+        voiceModeActive = true
+        appendLog("Audio: IN_COMMUNICATION, speaker=ON, vol=$maxVol/$maxVol")
+    }
+
+    private fun restoreAudioMode() {
+        try {
+            audioManager.mode = savedAudioMode
+            audioManager.isSpeakerphoneOn = savedSpeakerphone
+            @Suppress("DEPRECATION")
+            audioManager.isMicrophoneMute = savedMicMute
+            voiceModeActive = false
+            appendLog("Audio mode restored")
+        } catch (_: Exception) {}
+    }
 
     override fun onRegState(code: Int, reason: String, registered: Boolean) {
         runOnUiThread {
@@ -95,6 +150,10 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
         runOnUiThread {
             statusView.text = "Call: $state ($lastStatusCode $lastReason)"
             appendLog("CallState: $state  $lastStatusCode $lastReason")
+
+            if (state == "DISCONNECTED" && voiceModeActive) {
+                restoreAudioMode()
+            }
         }
     }
 

@@ -32,10 +32,12 @@ class PjsipManager(private val listener: Listener) {
         private const val TAG = "PjsipManager"
 
         // PJSIP invite state ints — stable across PJSUA2 versions.
+        internal const val INV_STATE_CONFIRMED = 5
         internal const val INV_STATE_DISCONNECTED = 6
 
         // PJSUA call media status ints.
         internal const val MEDIA_STATUS_ACTIVE = 1
+        internal const val MEDIA_STATUS_LOCAL_HOLD = 2
         internal const val MEDIA_STATUS_REMOTE_HOLD = 3
 
         // PJMEDIA type audio.
@@ -73,11 +75,27 @@ class PjsipManager(private val listener: Listener) {
 
             val writer = PjsipLogWriter(listener)
             cfg.logConfig.writer = writer
-            // Hold strong refs so neither gets collected by Kotlin GC.
             this.logWriter = writer
             this.epConfig = cfg
 
             cfg.uaConfig.userAgent = "SipCallAndroid/1.0 PJSUA2"
+
+            // ---- STUN: critical for NAT traversal ----
+            // Without this, PJSIP advertises the phone's private LAN IP
+            // (e.g. 10.38.149.168) in SDP, and the FreeSWITCH server cannot
+            // route RTP back to a private address — result: zero audio.
+            // Google's public STUN servers are fine for testing.
+            cfg.uaConfig.stunServer.add("stun.l.google.com:19302")
+            cfg.uaConfig.stunServer.add("stun1.l.google.com:19302")
+
+            // Media config — important for Android audio.
+            cfg.medConfig.clockRate = 16000
+            cfg.medConfig.sndClockRate = 16000
+            cfg.medConfig.channelCount = 1
+            cfg.medConfig.audioFramePtime = 20
+            // Disable PJSIP's software echo canceller — Android's
+            // MODE_IN_COMMUNICATION already provides hardware AEC.
+            cfg.medConfig.ecTailLen = 0
 
             ep.libInit(cfg)
 
@@ -96,18 +114,12 @@ class PjsipManager(private val listener: Listener) {
             safeSetCodecPriority(ep, "G722/8000", 240)
             safeSetCodecPriority(ep, "opus/48000", 230)
 
+            setupAudioDevice(ep)
+
             endpoint = ep
         } catch (e: Throwable) {
             Log.e(TAG, "start() failed", e)
             listener.onLog("PJSIP start failed: ${e.message}")
-        }
-    }
-
-    private fun safeSetCodecPriority(ep: Endpoint, codec: String, prio: Int) {
-        try {
-            ep.codecSetPriority(codec, prio.toShort())
-        } catch (e: Exception) {
-            Log.w(TAG, "Codec $codec not available: ${e.message}")
         }
     }
 
@@ -126,7 +138,6 @@ class PjsipManager(private val listener: Listener) {
             return
         }
 
-        // Tear down any existing account first.
         try { account?.delete() } catch (_: Exception) {}
         account = null
 
@@ -140,9 +151,27 @@ class PjsipManager(private val listener: Listener) {
             val cred = AuthCredInfo("digest", "*", username, 0, password)
             acfg.sipConfig.authCreds.add(cred)
 
-            // If audio is one-way on a real call, uncomment both:
-             acfg.natConfig.iceEnabled = false
-             acfg.sipConfig.proxies.add("sip:$serverIp:$serverPort;lr")
+            // ---- NAT traversal config ----
+            // Use STUN to discover public IP/port for SDP and RTP.
+            acfg.natConfig.sipStunUse = pjsua_stun_use.PJSUA_STUN_USE_DEFAULT
+            acfg.natConfig.mediaStunUse = pjsua_stun_use.PJSUA_STUN_USE_DEFAULT
+
+            // ICE off — FreeSWITCH typically doesn't need it and ICE adds
+            // setup time. STUN-discovered public address in SDP is enough.
+            acfg.natConfig.iceEnabled = false
+
+            // Force re-INVITE / UPDATE if the discovered public address
+            // changes mid-call (e.g. NAT rebinding).
+            acfg.natConfig.contactRewriteUse = 1
+            acfg.natConfig.viaRewriteUse = 1
+            acfg.natConfig.sdpNatRewriteUse = 1
+
+            // Send small UDP keepalive every 15s so the NAT pinhole on the
+            // SIP transport stays open between REGISTER and INVITE.
+            acfg.natConfig.udpKaIntervalSec = 15
+
+            // Route through registrar so requests follow the same path.
+            acfg.sipConfig.proxies.add("sip:$serverIp:$serverPort;lr")
 
             val acc = SipAccount(listener, this, ep)
             listener.onLog("Creating account sip:$username@$serverIp ...")
@@ -155,6 +184,62 @@ class PjsipManager(private val listener: Listener) {
             listener.onLog("Register failed: ${e.message}")
         }
     }
+
+
+
+    private fun setupAudioDevice(ep: Endpoint) {
+        try {
+            val audDevMgr = ep.audDevManager()
+            val devCount = audDevMgr.devCount
+            listener.onLog("Audio device count: $devCount")
+            Log.d(TAG, "Audio device count: $devCount")
+
+            if (devCount <= 0) {
+                listener.onLog(
+                    "WARNING: no audio devices found. Your libpjsua2.so was " +
+                            "built without OpenSL/Oboe support — rebuild PJSIP with " +
+                            "PJMEDIA_AUDIO_DEV_HAS_OPENSL=1 or PJMEDIA_AUDIO_DEV_HAS_ANDROID_OBOE=1."
+                )
+                return
+            }
+
+            // Log every device so we know what backend is compiled in.
+            var nonNullDev: Long = -1
+            for (i in 0 until devCount) {
+                val info = audDevMgr.getDevInfo(i.toInt())
+                val name = info.name ?: "?"
+                val driver = info.driver ?: "?"
+                listener.onLog("  AudDev[$i] $name drv=$driver in=${info.inputCount} out=${info.outputCount}")
+                Log.d(TAG, "  AudDev[$i] $name drv=$driver in=${info.inputCount} out=${info.outputCount}")
+
+                // Prefer first device that isn't the Null Audio Device.
+                if (nonNullDev < 0 &&
+                    !name.contains("Null", ignoreCase = true) &&
+                    info.inputCount > 0 && info.outputCount > 0
+                ) {
+                    nonNullDev = i
+                }
+            }
+
+            val dev = if (nonNullDev >= 0) nonNullDev else 0
+            audDevMgr.setCaptureDev(dev.toInt())
+            audDevMgr.setPlaybackDev(dev.toInt())
+            listener.onLog("Audio device set to index $dev")
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio dev setup failed", e)
+            listener.onLog("Audio dev setup failed: ${e.message}")
+        }
+    }
+
+    private fun safeSetCodecPriority(ep: Endpoint, codec: String, prio: Int) {
+        try {
+            ep.codecSetPriority(codec, prio.toShort())
+        } catch (e: Exception) {
+            Log.w(TAG, "Codec $codec not available: ${e.message}")
+        }
+    }
+
+
 
     fun call(destNumber: String) {
         val acc = account ?: run {
@@ -331,14 +416,14 @@ internal class SipCall(
             for (i in 0 until ci.media.size.toInt()) {
                 val mi = ci.media[i]
                 val isAudio = (mi.type == PjsipManager.MEDIA_TYPE_AUDIO)
-                val isLive = (mi.status == PjsipManager.MEDIA_STATUS_ACTIVE ||
-                        mi.status == PjsipManager.MEDIA_STATUS_REMOTE_HOLD)
-                if (isAudio && isLive) {
+                val isActive = (mi.status == PjsipManager.MEDIA_STATUS_ACTIVE)
+
+                if (isAudio && isActive) {
                     val aud = getAudioMedia(i)
                     val mgr = Endpoint.instance().audDevManager()
                     mgr.captureDevMedia.startTransmit(aud)
                     aud.startTransmit(mgr.playbackDevMedia)
-                    listener.onLog("Audio media active (codec negotiated)")
+                    listener.onLog("Audio bridged")
                 }
             }
         } catch (e: Exception) {
