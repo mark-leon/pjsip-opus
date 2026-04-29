@@ -13,12 +13,16 @@ import org.pjsip.pjsua2.*
  * collect it, and the next callback from a PJSIP thread dereferences a
  * freed pointer → SIGSEGV inside pj::Endpoint::utilLogWrite / similar.
  *
- * We therefore hold STRONG references to every director object for as
- * long as PJSIP can call back into it:
- *   - logWriter  : field, lives until shutdown()
- *   - account    : field
- *   - currentCall: field
- *   - epConfig   : field (holds the log writer reference on the C++ side)
+ * INCOMING CALL HANDLING:
+ * On an inbound INVITE, PJSUA2 fires Account.onIncomingCall() with a
+ * native call id. We MUST construct a Call object that wraps that id
+ * BEFORE the callback returns, otherwise the native side has no Java
+ * peer for the call and the next pjsua_call_hangup() crashes inside
+ * pjsip_inv_end_session() with "Invalid operation!" — which is exactly
+ * the SIGABRT we saw at sip_inv.c:2688.
+ *
+ * Once we own the Call object, we either answer (200 OK) or hangup
+ * cleanly through it.
  */
 class PjsipManager(private val listener: Listener) {
 
@@ -26,12 +30,23 @@ class PjsipManager(private val listener: Listener) {
         fun onRegState(code: Int, reason: String, registered: Boolean)
         fun onCallState(state: String, lastStatusCode: Int, lastReason: String)
         fun onLog(line: String)
+        /**
+         * Called on the PJSIP worker thread when an inbound INVITE arrives.
+         * Default is auto-answer; override in MainActivity if you want to
+         * present a UI prompt instead.
+         */
+        fun onIncomingCall(remoteUri: String) {}
     }
 
     companion object {
         private const val TAG = "PjsipManager"
 
         // PJSIP invite state ints — stable across PJSUA2 versions.
+        internal const val INV_STATE_NULL = 0
+        internal const val INV_STATE_CALLING = 1
+        internal const val INV_STATE_INCOMING = 2
+        internal const val INV_STATE_EARLY = 3
+        internal const val INV_STATE_CONNECTING = 4
         internal const val INV_STATE_CONFIRMED = 5
         internal const val INV_STATE_DISCONNECTED = 6
 
@@ -58,8 +73,7 @@ class PjsipManager(private val listener: Listener) {
     private var account: SipAccount? = null
     private var currentCall: SipCall? = null
 
-    // STRONG references — do NOT let these go out of scope, GC will eat
-    // the Kotlin instance and the native side will dereference garbage.
+    // STRONG references — do NOT let these go out of scope.
     private var logWriter: PjsipLogWriter? = null
     private var epConfig: EpConfig? = null
 
@@ -80,11 +94,9 @@ class PjsipManager(private val listener: Listener) {
 
             cfg.uaConfig.userAgent = "SipCallAndroid/1.0 PJSUA2"
 
-            // ---- STUN: critical for NAT traversal ----
-            // Without this, PJSIP advertises the phone's private LAN IP
-            // (e.g. 10.38.149.168) in SDP, and the FreeSWITCH server cannot
-            // route RTP back to a private address — result: zero audio.
-            // Google's public STUN servers are fine for testing.
+            // ---- STUN: critical for NAT traversal on outbound RTP. ----
+            // For receive-only, this still helps because PJSIP advertises
+            // the public address in the 200 OK SDP it sends back.
             cfg.uaConfig.stunServer.add("stun.l.google.com:19302")
             cfg.uaConfig.stunServer.add("stun1.l.google.com:19302")
 
@@ -109,6 +121,8 @@ class PjsipManager(private val listener: Listener) {
             ep.libStart()
             Log.d(TAG, "PJSIP endpoint started")
 
+            // FreeSWITCH's gateway leg offers PCMU/PCMA/telephone-event only
+            // (see remote SDP in FS log). Match those at top priority.
             safeSetCodecPriority(ep, "PCMU/8000", 255)
             safeSetCodecPriority(ep, "PCMA/8000", 254)
             safeSetCodecPriority(ep, "G722/8000", 240)
@@ -152,8 +166,13 @@ class PjsipManager(private val listener: Listener) {
             val cred = AuthCredInfo("digest", "*", username, 0, password)
             acfg.sipConfig.authCreds.add(cred)
 
-            // If audio is one-way on a real call, uncomment both:
+            // ICE off — FreeSWITCH internal profile in your config is not
+            // ICE-lite, and ICE handshake adds round-trips that have caused
+            // INVITE timeouts on flaky carriers.
             acfg.natConfig.iceEnabled = false
+
+            // Outbound proxy with loose-routing — keeps signalling on the
+            // same path FreeSWITCH expects.
             acfg.sipConfig.proxies.add("sip:$serverIp:$serverPort;lr")
 
             val acc = SipAccount(listener, this, ep)
@@ -168,8 +187,6 @@ class PjsipManager(private val listener: Listener) {
         }
     }
 
-
-
     private fun setupAudioDevice(ep: Endpoint) {
         try {
             val audDevMgr = ep.audDevManager()
@@ -179,23 +196,21 @@ class PjsipManager(private val listener: Listener) {
 
             if (devCount <= 0) {
                 listener.onLog(
-                    "WARNING: no audio devices found. Your libpjsua2.so was " +
-                            "built without OpenSL/Oboe support — rebuild PJSIP with " +
-                            "PJMEDIA_AUDIO_DEV_HAS_OPENSL=1 or PJMEDIA_AUDIO_DEV_HAS_ANDROID_OBOE=1."
+                    "WARNING: no audio devices found. libpjsua2.so was built " +
+                            "without OpenSL/Oboe — rebuild with " +
+                            "PJMEDIA_AUDIO_DEV_HAS_OPENSL=1 or " +
+                            "PJMEDIA_AUDIO_DEV_HAS_ANDROID_OBOE=1."
                 )
                 return
             }
 
-            // Log every device so we know what backend is compiled in.
             var nonNullDev: Long = -1
             for (i in 0 until devCount) {
                 val info = audDevMgr.getDevInfo(i.toInt())
                 val name = info.name ?: "?"
                 val driver = info.driver ?: "?"
                 listener.onLog("  AudDev[$i] $name drv=$driver in=${info.inputCount} out=${info.outputCount}")
-                Log.d(TAG, "  AudDev[$i] $name drv=$driver in=${info.inputCount} out=${info.outputCount}")
 
-                // Prefer first device that isn't the Null Audio Device.
                 if (nonNullDev < 0 &&
                     !name.contains("Null", ignoreCase = true) &&
                     info.inputCount > 0 && info.outputCount > 0
@@ -221,8 +236,6 @@ class PjsipManager(private val listener: Listener) {
             Log.w(TAG, "Codec $codec not available: ${e.message}")
         }
     }
-
-
 
     fun call(destNumber: String) {
         val acc = account ?: run {
@@ -266,6 +279,71 @@ class PjsipManager(private val listener: Listener) {
         }
     }
 
+    /**
+     * Called by SipAccount.onIncomingCall (PJSIP worker thread) after it
+     * has constructed the Call object and claimed the native call id.
+     * We hold a strong ref so GC can't collect the Kotlin side, then
+     * auto-answer with 200 OK.
+     */
+    internal fun handleIncomingCall(call: SipCall) {
+        // If there's already a call, reject the new one with 486 Busy Here.
+        // Otherwise PJSIP gets confused tracking two simultaneous calls.
+        if (currentCall != null) {
+            try {
+                val busy = CallOpParam()
+                busy.statusCode = pjsip_status_code.PJSIP_SC_BUSY_HERE
+                call.hangup(busy)
+                listener.onLog("Rejected incoming call (busy)")
+            } catch (_: Exception) {}
+            try { call.delete() } catch (_: Exception) {}
+            return
+        }
+
+        currentCall = call
+
+        try {
+            // Send 180 Ringing immediately so FreeSWITCH knows we got the
+            // INVITE — this stops the 32-second CONSUME_MEDIA timeout we
+            // saw in earlier logs (RECOVERY_ON_TIMER_EXPIRE).
+            val ringing = CallOpParam()
+            ringing.statusCode = pjsip_status_code.PJSIP_SC_RINGING
+            call.answer(ringing)
+            listener.onLog("Sent 180 Ringing")
+
+            // Then auto-answer with 200 OK. If you later want to show a
+            // ringing UI and let the user accept, move the 200 OK answer
+            // into a separate fun answerCurrent() method called from UI.
+            val ok = CallOpParam()
+            ok.statusCode = pjsip_status_code.PJSIP_SC_OK
+            call.answer(ok)
+            listener.onLog("Sent 200 OK (auto-answer)")
+        } catch (e: Throwable) {
+            Log.e(TAG, "answer() failed", e)
+            listener.onLog("Answer failed: ${e.message}")
+            try { call.hangup(CallOpParam(true)) } catch (_: Exception) {}
+            currentCall = null
+        }
+    }
+
+    /**
+     * Manual answer for the ringing call. Use this if you stop auto-answering
+     * inside handleIncomingCall and want a UI "Accept" button instead.
+     */
+    fun answerCurrent() {
+        val call = currentCall ?: run {
+            listener.onLog("No call to answer")
+            return
+        }
+        try {
+            val ok = CallOpParam()
+            ok.statusCode = pjsip_status_code.PJSIP_SC_OK
+            call.answer(ok)
+            listener.onLog("Sent 200 OK")
+        } catch (e: Exception) {
+            listener.onLog("answerCurrent failed: ${e.message}")
+        }
+    }
+
     fun hangup() {
         currentCall?.let {
             try { it.hangup(CallOpParam(true)) } catch (e: Exception) {
@@ -295,8 +373,6 @@ class PjsipManager(private val listener: Listener) {
             }
             endpoint = null
 
-            // Release director refs last, after endpoint is gone so no
-            // log callbacks can still arrive.
             logWriter = null
             epConfig = null
         } catch (e: Throwable) {
@@ -305,19 +381,6 @@ class PjsipManager(private val listener: Listener) {
     }
 }
 
-/**
- * Safe thread-registration helper.
- *
- * PJSIP callbacks (onRegState, onCallState, onCallMediaState, LogWriter.write)
- * usually run on PJSIP's OWN worker thread, which PJSIP already has a
- * pj_thread_t descriptor for. Calling Endpoint.libRegisterThread() again on
- * such a thread replaces the descriptor, then the next pj_grp_lock_release
- * fails its ownership assertion → SIGABRT in pj/lock.c line 273.
- *
- * We must only register threads PJSIP hasn't seen. Use libIsThreadRegistered()
- * to gate the call. This matches the guidance in the PJSUA2 docs:
- *   "Only register threads which are not created by PJLIB or PJSIP itself."
- */
 internal object PjsipThreads {
     fun ensureRegistered(ep: Endpoint?) {
         val e = ep ?: return
@@ -326,17 +389,10 @@ internal object PjsipThreads {
                 e.libRegisterThread(Thread.currentThread().name)
             }
         } catch (_: Throwable) {
-            // If the registration check or call fails, there's nothing
-            // safer we can do — swallow rather than crash the callback.
         }
     }
 }
 
-/**
- * Top-level LogWriter subclass. Kept as a named class (not anonymous
- * inside start()) so its lifetime isn't tied to a local scope —
- * PjsipManager holds a field reference to the instance.
- */
 internal class PjsipLogWriter(
     private val listener: PjsipManager.Listener
 ) : LogWriter() {
@@ -361,9 +417,24 @@ internal class SipAccount(
         listener.onRegState(code, reason, active)
     }
 
+    /**
+     * CRITICAL: We must construct a SipCall here using prm.callId so the
+     * native call id has a Java/Kotlin peer object. Without this, PJSUA's
+     * own cleanup path tries to hangup an "invalid" invite session and
+     * SIGABRTs at sip_inv.c:2688.
+     */
     override fun onIncomingCall(prm: OnIncomingCallParam) {
         PjsipThreads.ensureRegistered(ep)
-        listener.onLog("Incoming call ignored (callId=${prm.callId})")
+        try {
+            val call = SipCall(this, listener, manager, prm.callId)
+            val remoteUri = try { call.info.remoteUri ?: "" } catch (_: Exception) { "" }
+            listener.onLog("Incoming call from $remoteUri (callId=${prm.callId})")
+            listener.onIncomingCall(remoteUri)
+            manager.handleIncomingCall(call)
+        } catch (e: Throwable) {
+            Log.e("SipAccount", "onIncomingCall failed", e)
+            listener.onLog("onIncomingCall failed: ${e.message}")
+        }
     }
 }
 
@@ -406,7 +477,7 @@ internal class SipCall(
                     val mgr = Endpoint.instance().audDevManager()
                     mgr.captureDevMedia.startTransmit(aud)
                     aud.startTransmit(mgr.playbackDevMedia)
-                    listener.onLog("Audio bridged")
+                    listener.onLog("Audio bridged (media idx=$i)")
                 }
             }
         } catch (e: Exception) {

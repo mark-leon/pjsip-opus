@@ -49,7 +49,7 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
         logView = findViewById(R.id.log)
 
         serverIpInput.setText("103.209.42.79")
-        usernameInput.setText("1001")
+        usernameInput.setText("09638917840")
         passwordInput.setText("1234")
         destNumberInput.setText("01716517528")
 
@@ -66,11 +66,7 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
             )
         }
         callBtn.setOnClickListener {
-            // CRITICAL: enter voice mode BEFORE PJSIP opens the audio device.
-            // PJSIP opens the device synchronously inside makeCall(), and on
-            // Android the device's routing is decided AT OPEN TIME based on
-            // the current AudioManager.mode. Setting it after the call starts
-            // is too late — the mic ends up on the wrong path and captures silence.
+            // Enter voice mode BEFORE PJSIP opens the audio device. Outbound only.
             enterVoiceCallMode()
             pjsip.call(destNumberInput.text.toString().trim())
         }
@@ -105,21 +101,13 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
         @Suppress("DEPRECATION")
         savedMicMute = audioManager.isMicrophoneMute
 
-        // VoIP mode
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-
-        // Force speakerphone ON so audio comes out the loud speaker
-        audioManager.isSpeakerphoneOn = true
-
-        // Make sure mic isn't muted
+        audioManager.isSpeakerphoneOn = false
         @Suppress("DEPRECATION")
         audioManager.isMicrophoneMute = false
 
-        // Crank the call volume to max so we can definitely hear it
         val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
         audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, maxVol, 0)
-
-        // Also bump the music stream as a fallback in case routing is wrong
         val maxMusic = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, maxMusic, 0)
 
@@ -143,6 +131,20 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
             val tag = if (registered) "REGISTERED" else "UNREGISTERED"
             statusView.text = "SIP: $tag ($code $reason)"
             appendLog("RegState: $code $reason  registered=$registered")
+        }
+    }
+
+    /**
+     * Fired on PJSIP's worker thread the moment an inbound INVITE arrives.
+     * We need to flip the AudioManager into MODE_IN_COMMUNICATION BEFORE
+     * the media transport starts pumping audio frames, otherwise the
+     * capture device opens on the wrong route and the remote side hears
+     * nothing.
+     */
+    override fun onIncomingCall(remoteUri: String) {
+        runOnUiThread {
+            appendLog("Incoming call from $remoteUri")
+            enterVoiceCallMode()
         }
     }
 
