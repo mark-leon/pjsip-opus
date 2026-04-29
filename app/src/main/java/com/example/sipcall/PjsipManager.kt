@@ -138,6 +138,7 @@ class PjsipManager(private val listener: Listener) {
             return
         }
 
+        // Tear down any existing account first.
         try { account?.delete() } catch (_: Exception) {}
         account = null
 
@@ -151,26 +152,8 @@ class PjsipManager(private val listener: Listener) {
             val cred = AuthCredInfo("digest", "*", username, 0, password)
             acfg.sipConfig.authCreds.add(cred)
 
-            // ---- NAT traversal config ----
-            // Use STUN to discover public IP/port for SDP and RTP.
-            acfg.natConfig.sipStunUse = pjsua_stun_use.PJSUA_STUN_USE_DEFAULT
-            acfg.natConfig.mediaStunUse = pjsua_stun_use.PJSUA_STUN_USE_DEFAULT
-
-            // ICE off — FreeSWITCH typically doesn't need it and ICE adds
-            // setup time. STUN-discovered public address in SDP is enough.
+            // If audio is one-way on a real call, uncomment both:
             acfg.natConfig.iceEnabled = false
-
-            // Force re-INVITE / UPDATE if the discovered public address
-            // changes mid-call (e.g. NAT rebinding).
-            acfg.natConfig.contactRewriteUse = 1
-            acfg.natConfig.viaRewriteUse = 1
-            acfg.natConfig.sdpNatRewriteUse = 1
-
-            // Send small UDP keepalive every 15s so the NAT pinhole on the
-            // SIP transport stays open between REGISTER and INVITE.
-            acfg.natConfig.udpKaIntervalSec = 15
-
-            // Route through registrar so requests follow the same path.
             acfg.sipConfig.proxies.add("sip:$serverIp:$serverPort;lr")
 
             val acc = SipAccount(listener, this, ep)
