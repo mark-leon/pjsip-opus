@@ -105,6 +105,8 @@ class PjsipManager(private val listener: Listener) {
             cfg.medConfig.sndClockRate = 16000
             cfg.medConfig.channelCount = 1
             cfg.medConfig.audioFramePtime = 20
+            cfg.medConfig.quality = 10      // max PJSIP signal processing quality
+            cfg.medConfig.jbMax   = 300     // 300 ms ceiling absorbs WiFi burst losses
             // Disable PJSIP's software echo canceller — Android's
             // MODE_IN_COMMUNICATION already provides hardware AEC.
             cfg.medConfig.ecTailLen = 0
@@ -121,13 +123,16 @@ class PjsipManager(private val listener: Listener) {
             ep.libStart()
             Log.d(TAG, "PJSIP endpoint started")
 
-            // FreeSWITCH's gateway leg offers PCMU/PCMA/telephone-event only
-            // (see remote SDP in FS log). Match those at top priority.
-            safeSetCodecPriority(ep, "PCMU/8000", 255)
-            safeSetCodecPriority(ep, "PCMA/8000", 254)
-            safeSetCodecPriority(ep, "G722/8000", 240)
-            safeSetCodecPriority(ep, "opus/48000", 230)
+            // Prefer Opus for low bandwidth (~1.5 MB/5 min at 24 kbps + 20 ms ptime + VAD).
+            // PCMU kept as last-resort fallback if the FS internal profile lacks Opus.
+            // NOTE: FreeSWITCH's internal SIP profile must list Opus in codec-prefs
+            // (e.g. opus,PCMU,PCMA) or the negotiation will fall back to PCMU/PCMA.
+            safeSetCodecPriority(ep, "opus/48000", 255)
+            safeSetCodecPriority(ep, "PCMU/8000",  1)
+            safeSetCodecPriority(ep, "PCMA/8000",  0)
+            safeSetCodecPriority(ep, "G722/8000",  0)
 
+            configureOpus(ep)
             setupAudioDevice(ep)
 
             endpoint = ep
@@ -234,6 +239,34 @@ class PjsipManager(private val listener: Listener) {
             ep.codecSetPriority(codec, prio.toShort())
         } catch (e: Exception) {
             Log.w(TAG, "Codec $codec not available: ${e.message}")
+        }
+    }
+
+    private fun configureOpus(ep: Endpoint) {
+        try {
+            // 24 kbps wideband mono, 20 ms ptime.
+            // 20 ms ptime: loses only 20 ms per dropped packet (vs 40 ms) and
+            // activates Opus in-band FEC (packet_loss > 0 requires ptime <= 20 ms).
+            val opusCfg = ep.codecOpusConfig
+            opusCfg.bit_rate    = 24000
+            opusCfg.frm_ptime   = 20
+            opusCfg.channel_cnt = 1
+            // Opus FEC: embeds a low-bitrate copy of the previous frame so the
+            // receiver can reconstruct it if that packet was lost. Tells the
+            // encoder to expect ~10 % packet loss on the path.
+            opusCfg.packet_loss = 10
+            ep.setCodecOpusConfig(opusCfg)
+
+            val param = ep.codecGetParam("opus/48000")
+            param.setting.vad  = true   // DTX — no RTP during silence
+            param.setting.plc  = true   // interpolate lost frames
+            param.setting.penh = true   // perceptual post-filter (clarity)
+            ep.codecSetParam("opus/48000", param)
+
+            listener.onLog("Opus: 24 kbps, 20 ms ptime, FEC on, VAD/PLC/PENH on")
+        } catch (e: Exception) {
+            Log.w(TAG, "Opus config failed: ${e.message}")
+            listener.onLog("Opus config failed: ${e.message}")
         }
     }
 

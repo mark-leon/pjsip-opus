@@ -51,7 +51,7 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
         serverIpInput.setText("103.209.42.79")
         usernameInput.setText("09638917840")
         passwordInput.setText("1234")
-        destNumberInput.setText("01716517528")
+        destNumberInput.setText("01833023200")
 
         ensurePermissions()
 
