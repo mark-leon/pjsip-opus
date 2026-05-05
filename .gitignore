@@ -1,15 +1,36 @@
-*.iml
+# Built outputs
+/build
+app/build
+
+# Gradle
 .gradle
-/local.properties
+gradle/wrapper/gradle-wrapper.jar
+
+# Local config (machine-specific, never share)
+local.properties
+
+# Android Studio / IntelliJ — machine-specific IDE state
+*.iml
 /.idea/caches
 /.idea/libraries
 /.idea/modules.xml
 /.idea/workspace.xml
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
+/.idea/deploymentTargetSelector.xml
+
+# macOS
 .DS_Store
-/build
-/captures
+
+# Native build intermediates
 .externalNativeBuild
 .cxx
-local.properties
+
+# Captures (profiling/screenshots)
+/captures
+
+# Keystore / signing secrets — NEVER commit these
+*.jks
+*.keystore
+keystore.properties
+release/
