@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.os.Bundle
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -21,6 +22,8 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
     private lateinit var usernameInput: EditText
     private lateinit var passwordInput: EditText
     private lateinit var destNumberInput: EditText
+    private lateinit var tlsCheckBox: CheckBox
+    private lateinit var srtpCheckBox: CheckBox
     private lateinit var registerBtn: Button
     private lateinit var callBtn: Button
     private lateinit var hangupBtn: Button
@@ -42,9 +45,11 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
         usernameInput = findViewById(R.id.username)
         passwordInput = findViewById(R.id.password)
         destNumberInput = findViewById(R.id.dest_number)
-        registerBtn = findViewById(R.id.btn_register)
-        callBtn = findViewById(R.id.btn_call)
-        hangupBtn = findViewById(R.id.btn_hangup)
+        tlsCheckBox  = findViewById(R.id.chk_tls)
+        srtpCheckBox = findViewById(R.id.chk_srtp)
+        registerBtn  = findViewById(R.id.btn_register)
+        callBtn      = findViewById(R.id.btn_call)
+        hangupBtn    = findViewById(R.id.btn_hangup)
         statusView = findViewById(R.id.status)
         logView = findViewById(R.id.log)
 
@@ -62,7 +67,10 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
             pjsip.register(
                 username = usernameInput.text.toString().trim(),
                 password = passwordInput.text.toString(),
-                serverIp = serverIpInput.text.toString().trim()
+                serverIp = serverIpInput.text.toString().trim(),
+                serverPort = if (tlsCheckBox.isChecked) 5061 else 5060,
+                useTls  = tlsCheckBox.isChecked,
+                useSrtp = srtpCheckBox.isChecked
             )
         }
         callBtn.setOnClickListener {
