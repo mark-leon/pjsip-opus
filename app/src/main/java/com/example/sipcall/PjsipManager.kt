@@ -102,12 +102,12 @@ class PjsipManager(private val listener: Listener) {
             cfg.uaConfig.stunServer.add("stun1.l.google.com:19302")
 
             // Media config — important for Android audio.
-            cfg.medConfig.clockRate = 32000
-            cfg.medConfig.sndClockRate = 32000
+            cfg.medConfig.clockRate = 8000
+            cfg.medConfig.sndClockRate = 8000
             cfg.medConfig.channelCount = 1
-            cfg.medConfig.audioFramePtime = 40
+            cfg.medConfig.audioFramePtime = 60
             cfg.medConfig.quality = 10      // max PJSIP signal processing quality
-            cfg.medConfig.jbMax   = 100     // 300 ms ceiling absorbs WiFi burst losses
+            cfg.medConfig.jbMax   = 200     // 300 ms ceiling absorbs WiFi burst losses
             // Disable PJSIP's software echo canceller — Android's
             // MODE_IN_COMMUNICATION already provides hardware AEC.
             cfg.medConfig.ecTailLen = 0
@@ -295,8 +295,8 @@ class PjsipManager(private val listener: Listener) {
             // 20 ms ptime: loses only 20 ms per dropped packet (vs 40 ms) and
             // activates Opus in-band FEC (packet_loss > 0 requires ptime <= 20 ms).
             val opusCfg = ep.codecOpusConfig
-            opusCfg.bit_rate    = 32000
-            opusCfg.frm_ptime   = 40
+            opusCfg.bit_rate    = 8000
+            opusCfg.frm_ptime   = 60
             opusCfg.channel_cnt = 1
             // Opus FEC: embeds a low-bitrate copy of the previous frame so the
             // receiver can reconstruct it if that packet was lost. Tells the

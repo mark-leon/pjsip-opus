@@ -53,10 +53,10 @@ class MainActivity : AppCompatActivity(), PjsipManager.Listener {
         statusView = findViewById(R.id.status)
         logView = findViewById(R.id.log)
 
-        serverIpInput.setText("103.209.42.79")
-        usernameInput.setText("09638917840")
+        serverIpInput.setText("esports.hobenaki.com")
+        usernameInput.setText("09638917841")
         passwordInput.setText("1234")
-        destNumberInput.setText("01833023200")
+        destNumberInput.setText("01673779266")
 
         ensurePermissions()
 
